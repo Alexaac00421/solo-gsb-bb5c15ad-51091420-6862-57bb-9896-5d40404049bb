@@ -19,17 +19,20 @@ from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
-from .models import Batch, Report, UploadChunk, UploadSession, ZoneVersion
+from .models import (Batch, Report, UploadChunk, UploadSession, ZoneBaseline,
+                     ZoneVersion)
 from .schemas import (MAX_CHUNK_BYTES, MAX_CHUNK_COUNT, MAX_TOTAL_BYTES,
-                      BatchItemResult, BatchReviewRequest, BatchReviewResponse,
-                      ChunkReceipt, MinClearanceOut, ReviewRequest,
-                      ReviewResponse, TraceEventOut, UploadCompleteRequest,
-                      UploadSessionCreate, UploadSessionOut, ZoneCreate,
-                      ZoneDetailOut, ZoneOut, ZoneVersionCreate, ZoneVersionOut)
+                      BaselineCreate, BaselineDetailOut, BaselineOut,
+                      BaselineSummaryOut, BatchItemResult, BatchReviewRequest,
+                      BatchReviewResponse, ChunkReceipt, MinClearanceOut,
+                      ReviewRequest, ReviewResponse, TraceEventOut,
+                      UploadCompleteRequest, UploadSessionCreate,
+                      UploadSessionOut, ZoneCreate, ZoneDetailOut, ZoneOut,
+                      ZoneRef, ZoneVersionCreate, ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.5.0",
+    version="1.6.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
@@ -39,15 +42,19 @@ app = FastAPI(
                 "batch_id 幂等，整批同一事务）；"
                 "支持长 G-code 可恢复分块上传（/uploads：冻结审查参数建会话，"
                 "0 起序号乱序提交 UTF-8 文本块，声明块数与整文 SHA-256 完成，"
-                "与单项审查同口径生成不可变报告，完成声明幂等）。",
+                "与单项审查同口径生成不可变报告，完成声明幂等）；"
+                "支持机床禁区基线（/baselines：按机床编号固化一组禁区编号+"
+                "明确版本，首版为 1，修订产生递增不可变新版本；单项审查、"
+                "批量任务与分块上传建会话可用 机床编号+基线版本 代替 zones，"
+                "审查时解析为对应禁区版本快照）。",
 )
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     # 容器内由应用直接完成数据库初始化（表结构创建；v1.4 新增 batches 表、
-    # v1.5 新增 upload_sessions / upload_chunks 表，对旧库同样由
-    # create_all 幂等建出）
+    # v1.5 新增 upload_sessions / upload_chunks 表、v1.6 新增 zone_baselines
+    # 机床基线表，对旧库同样由 create_all 幂等建出）
     Base.metadata.create_all(bind=engine)
     # 旧库 reports 表缺少后续版本新增列：幂等补齐，保证旧请求/旧报告仍可读写
     _ensure_report_columns(engine)
@@ -184,7 +191,121 @@ def add_zone_version(zone_no: int, payload: ZoneVersionCreate,
                           created_at=ver.created_at)
 
 
+# ---------- 机床禁区基线 ----------
+#
+# 车间按机床复用已核准的禁区组合：POST /baselines 以 机床编号 + 一组互不重复
+# 的禁区编号与明确版本提交基线，首版为 1；同一机床编号再次提交（修订）产生
+# 递增且不可变的新版本，旧版本永久保留可查询。单项审查（POST /reviews）、
+# 批量任务（POST /reviews/batch）与分块上传建会话（POST /uploads）均可用
+# "baseline": {"machine_no": ..., "version": ...} 代替原 zones，审查时解析为
+# 该基线版本固化的禁区版本快照；报告继续固化 used_zone_versions。
+
+def _baseline_out(b: ZoneBaseline) -> BaselineOut:
+    return BaselineOut(
+        machine_no=b.machine_no, version=b.version,
+        zones=[ZoneRef(zone_no=z["zone_no"], version=z["version"])
+               for z in b.zones],
+        description=b.description, created_at=b.created_at)
+
+
+@app.post("/baselines", response_model=BaselineOut, status_code=201,
+          summary="提交机床禁区基线（首版为 1；修订产生递增不可变新版本）")
+def create_baseline(payload: BaselineCreate,
+                    db: Session = Depends(get_db)) -> BaselineOut:
+    # 组内禁区编号互不重复由请求校验拒绝（422）；此处校验所引禁区编号与
+    # 明确版本存在（404），非法时不写入任何基线
+    refs = sorted(payload.zones, key=lambda r: r.zone_no)
+    _load_zones(db, refs)
+    frozen = [{"zone_no": r.zone_no, "version": r.version} for r in refs]
+
+    # 版本号 = 该机床当前最大版本 + 1（首版为 1）；(machine_no, version)
+    # 唯一约束兜底并发修订：冲突即重读最新版本重试，并发提交各获不同版本，
+    # 不丢失任何已成功提交的版本
+    for _ in range(10):
+        latest = db.scalar(select(func.max(ZoneBaseline.version)).where(
+            ZoneBaseline.machine_no == payload.machine_no)) or 0
+        baseline = ZoneBaseline(machine_no=payload.machine_no,
+                                version=latest + 1, zones=frozen,
+                                description=payload.description)
+        db.add(baseline)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            continue
+        db.refresh(baseline)
+        return _baseline_out(baseline)
+    raise HTTPException(status_code=409, detail={
+        "error": "baseline_revision_conflict",
+        "machine_no": payload.machine_no,
+        "message": "基线修订并发冲突，请重试"})
+
+
+@app.get("/baselines", response_model=list[BaselineSummaryOut],
+         summary="列出全部机床基线（每台机床的当前版本）")
+def list_baselines(db: Session = Depends(get_db)) -> list[BaselineSummaryOut]:
+    rows = db.scalars(select(ZoneBaseline).order_by(
+        ZoneBaseline.machine_no, ZoneBaseline.version)).all()
+    summaries: dict[str, BaselineSummaryOut] = {}
+    for b in rows:  # 按版本升序遍历，最后覆盖即为当前（最大）版本
+        summaries[b.machine_no] = BaselineSummaryOut(
+            machine_no=b.machine_no, current_version=b.version,
+            created_at=b.created_at)
+    return list(summaries.values())
+
+
+@app.get("/baselines/{machine_no}", response_model=BaselineDetailOut,
+         summary="查询某机床的全部基线版本（旧版本永久保留）")
+def get_machine_baselines(machine_no: str,
+                          db: Session = Depends(get_db)) -> BaselineDetailOut:
+    versions = db.scalars(select(ZoneBaseline)
+                          .where(ZoneBaseline.machine_no == machine_no)
+                          .order_by(ZoneBaseline.version)).all()
+    if not versions:
+        raise HTTPException(status_code=404,
+                            detail=f"机床 {machine_no!r} 不存在任何基线")
+    return BaselineDetailOut(
+        machine_no=machine_no, current_version=versions[-1].version,
+        versions=[_baseline_out(b) for b in versions])
+
+
+@app.get("/baselines/{machine_no}/versions/{version}",
+         response_model=BaselineOut,
+         summary="查询机床基线的指定不可变版本（固定禁区清单）")
+def get_baseline_version(machine_no: str, version: int,
+                         db: Session = Depends(get_db)) -> BaselineOut:
+    b = db.scalar(select(ZoneBaseline).where(
+        ZoneBaseline.machine_no == machine_no,
+        ZoneBaseline.version == version))
+    if b is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"机床 {machine_no!r} 不存在基线版本 {version}")
+    return _baseline_out(b)
+
+
 # ---------- 审查 ----------
+
+def _resolve_zone_refs(db: Session, payload) -> list[ZoneRef]:
+    """解析审查的禁区引用：zones 直传或 baseline（机床编号+基线版本）二选一。
+
+    baseline 解析为该基线版本固化的禁区清单（不可变快照）；基线不存在
+    返回 404，不进入后续审查（不落报告/会话）。zones 与 baseline 必居其一
+    由请求校验保证。
+    """
+    if payload.baseline is not None:
+        ref = payload.baseline
+        b = db.scalar(select(ZoneBaseline).where(
+            ZoneBaseline.machine_no == ref.machine_no,
+            ZoneBaseline.version == ref.version))
+        if b is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"机床 {ref.machine_no!r} 不存在基线版本 {ref.version}")
+        return [ZoneRef(zone_no=z["zone_no"], version=z["version"])
+                for z in b.zones]
+    return list(payload.zones) if payload.zones is not None else []
+
 
 def _load_zones(db: Session, refs) -> tuple[list[Zone], dict[str, int], dict[int, int]]:
     zones: list[Zone] = []
@@ -226,8 +347,10 @@ def _build_review(db: Session, payload: ReviewRequest) -> ReviewResponse:
     if payload.tool_radius < 0:
         raise HTTPException(status_code=422, detail="刀具半径不得为负")
 
-    # 先加载并固化所用禁区版本；任何非法输入都在写报告之前拒绝
-    zones, used_versions, _ = _load_zones(db, payload.zones)
+    # 先解析禁区引用（zones 直传或 机床编号+基线版本 快照）并加载固化；
+    # 任何非法输入都在写报告之前拒绝
+    zone_refs = _resolve_zone_refs(db, payload)
+    zones, used_versions, _ = _load_zones(db, zone_refs)
 
     tool_map = payload.tool_radii
     multi_tool = tool_map is not None
@@ -259,6 +382,10 @@ def _build_review(db: Session, payload: ReviewRequest) -> ReviewResponse:
         "gcode_sha256": _sha(payload.gcode),
         "include_min_clearance": bool(payload.include_min_clearance),
     }
+    if payload.baseline is not None:
+        # 固化本次基线引用；used_zone_versions 已解析为对应禁区版本快照
+        summary["baseline"] = {"machine_no": payload.baseline.machine_no,
+                               "version": payload.baseline.version}
     if multi_tool:
         # 固化本次多刀配置：刀号（字符串键，JSON 友好）-> 毫米半径
         summary["tool_map_enabled"] = True
@@ -469,8 +596,9 @@ def review_batch(payload: BatchReviewRequest,
 # ---------- 长 G-code 可恢复分块上传 ----------
 #
 # 车间网络不稳时的可恢复提交：
-# 1) POST /uploads 创建会话：冻结禁区编号 + 明确版本、初始刀尖坐标、刀半径
-#    与可选多刀/最小净间隙设置，返回会话标识 session_id；
+# 1) POST /uploads 创建会话：冻结禁区编号 + 明确版本（zones 直传或
+#    机床编号+基线版本）、初始刀尖坐标、刀半径与可选多刀/最小净间隙设置，
+#    返回会话标识 session_id；
 # 2) PUT /uploads/{session_id}/chunks/{seq} 以 0 起序号提交 UTF-8 文本块
 #    （可乱序；单块 <= 64 KiB，会话总量 <= 8 MiB；同号同内容重传返回原回执，
 #    同号异内容 409 冲突且不覆盖）；GET /uploads/{session_id} 查询已收序号；
@@ -511,9 +639,9 @@ def _chunk_receipt(session_id: str, seq: int, byte_len: int,
           summary="创建分块上传会话（冻结审查参数，返回会话标识）")
 def create_upload_session(payload: UploadSessionCreate,
                           db: Session = Depends(get_db)) -> UploadSessionOut:
-    # 创建时即校验禁区编号与明确版本存在（404/422 口径同 POST /reviews）；
-    # 版本几何不可变，完成时按同一编号+版本重载，结果一致
-    _load_zones(db, payload.zones)
+    # 创建时即校验基线/禁区编号与明确版本存在（404/422 口径同 POST /reviews）；
+    # 基线版本与禁区几何均不可变，完成时按建会话时冻结的引用重载，结果一致
+    _load_zones(db, _resolve_zone_refs(db, payload))
     session = UploadSession(session_id=uuid4().hex, status="open",
                             params=payload.model_dump(mode="json"))
     db.add(session)

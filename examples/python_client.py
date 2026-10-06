@@ -345,6 +345,71 @@ def main() -> None:
     print("incomplete upload rejected, session stays open:",
           c.get(f"/uploads/{sess2}").json()["status"])
 
+    # 13. 机床禁区基线：按机床编号固化一组互不重复的禁区编号+明确版本
+    #     （首版为 1），每次修订产生递增且不可变的新版本，旧版仍可查询；
+    #     单项审查/批量任务/分块上传建会话可用 机床编号+基线版本 代替 zones，
+    #     报告继续固化 used_zone_versions。
+    bl = c.post("/baselines", json={
+        "machine_no": "MC-01",
+        "zones": [{"zone_no": 1, "version": 1}],
+        "description": "已核准的基座组合",
+    })
+    bl.raise_for_status()  # 201，首版为 1，返回基线版本与固定禁区清单
+    assert bl.json()["version"] == 1
+    assert bl.json()["zones"] == [{"zone_no": 1, "version": 1}]
+    print("baseline:", bl.json()["machine_no"], "v" + str(bl.json()["version"]),
+          bl.json()["zones"])
+
+    # 用 机床编号+基线版本 代替 zones 提交审查（与直传 zones 同口径）
+    br = c.post("/reviews", json={
+        "baseline": {"machine_no": "MC-01", "version": 1},
+        "start": [-5.0, 5.0, 0.0],
+        "tool_radius": 0.0,
+        "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n",
+    })
+    br.raise_for_status()
+    body = br.json()
+    assert body["has_collision"] and body["used_zone_versions"] == {"1": 1}
+    assert body["input_summary"]["baseline"] == {"machine_no": "MC-01",
+                                                 "version": 1}
+    print("baseline review:", body["conclusion"],
+          body["used_zone_versions"])
+
+    # 修订 => 递增不可变新版本（引用禁区 1 的 v2，已平移到远处）；旧版仍可查询
+    bl2 = c.post("/baselines", json={
+        "machine_no": "MC-01",
+        "zones": [{"zone_no": 1, "version": 2}],
+    })
+    bl2.raise_for_status()
+    assert bl2.json()["version"] == 2
+    detail = c.get("/baselines/MC-01").json()
+    assert [v["version"] for v in detail["versions"]] == [1, 2]
+    # 基线快照不可变：v1 仍按禁区 v1 判定（碰撞），v2 按 v2（无碰撞）
+    v1r = c.post("/reviews", json={
+        "baseline": {"machine_no": "MC-01", "version": 1},
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X15 Y5 Z0\n"}).json()
+    v2r = c.post("/reviews", json={
+        "baseline": {"machine_no": "MC-01", "version": 2},
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X15 Y5 Z0\n"}).json()
+    assert v1r["has_collision"] and not v2r["has_collision"]
+    print("baseline snapshot immutable: v1 collision, v2 clear")
+
+    # zones 与 baseline 同传 => 422；基线不存在 => 404；均不落报告
+    both = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "baseline": {"machine_no": "MC-01", "version": 1},
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X1\n"})
+    assert both.status_code == 422
+    missing_bl = c.post("/reviews", json={
+        "baseline": {"machine_no": "MC-01", "version": 9},
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X1\n"})
+    assert missing_bl.status_code == 404
+    print("zones+baseline rejected (422); missing baseline rejected (404)")
+
 
 if __name__ == "__main__":
     main()

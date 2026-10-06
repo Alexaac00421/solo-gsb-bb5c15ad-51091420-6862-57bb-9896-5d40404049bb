@@ -2,6 +2,8 @@
 
 - zones：禁区逻辑实体（编号唯一）；
 - zone_versions：禁区的不可变版本，每次修改产生新版本，旧版本保留；
+- zone_baselines：机床禁区基线（机床编号 + 递增版本），固化一组互不重复的
+  禁区编号与明确版本；每次修订产生递增且不可变的新版本，旧版本保留；
 - reports：审查报告，创建后不可变，不随后续禁区版本变化；
 - batches：批量审查批次（batch_id 幂等键 + 内容哈希 + 逐项结果快照）；
 - upload_sessions / upload_chunks：长 G-code 可恢复分块上传会话及其文本块，
@@ -51,6 +53,33 @@ class ZoneVersion(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     zone = relationship("Zone", back_populates="versions")
+
+
+class ZoneBaseline(Base):
+    """机床禁区基线（v1.6）：按机床编号固化一组互不重复的禁区编号+明确版本。
+
+    首版为 1；同一机床编号再次提交（修订）产生递增且不可变的新版本，
+    旧版本永久保留可查询。(machine_no, version) 唯一约束兜底并发修订：
+    并发提交各自获得不同版本号，不丢失任何已成功提交的版本。
+    单项审查、批量任务与分块上传建会话可用 机床编号+基线版本 代替
+    zones，审查时解析为该基线版本固化的禁区版本快照。
+    """
+
+    __tablename__ = "zone_baselines"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_baseline_version_positive"),
+        Index("ix_zone_baseline_machine_version", "machine_no", "version",
+              unique=True),
+    )
+
+    id = Column(Integer, primary_key=True)
+    # 机床编号（字母数字开头，可含 _ . : -，最长 64）
+    machine_no = Column(String(64), nullable=False)
+    version = Column(Integer, nullable=False)
+    # 固化的禁区清单 [{"zone_no": int, "version": int}, ...]，按编号升序
+    zones = Column(JSON, nullable=False)
+    description = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class Report(Base):

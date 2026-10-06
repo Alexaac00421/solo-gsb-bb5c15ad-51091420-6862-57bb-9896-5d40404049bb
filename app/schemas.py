@@ -7,6 +7,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
+# 标识（批次/任务/机床编号）：字母数字开头，可含 _ . : -，最长 64
+_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$"
+
 
 def _finite(v: float, name: str) -> float:
     if not isinstance(v, (int, float)) or isinstance(v, bool):
@@ -80,13 +83,69 @@ class ZoneRef(BaseModel):
     version: int = Field(ge=1)
 
 
+# ---------- 机床禁区基线 ----------
+
+class BaselineRef(BaseModel):
+    """基线引用：机床编号 + 基线版本（审查时解析为该版本的禁区快照）。"""
+    machine_no: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    version: int = Field(ge=1)
+
+
+class BaselineCreate(BaseModel):
+    """提交机床禁区基线：机床编号 + 一组互不重复的禁区编号与明确版本。
+
+    同一机床编号首次提交为版本 1；每次修订（再次提交）产生递增且不可变
+    的新版本，旧版本永久保留。
+    """
+    machine_no: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    zones: list[ZoneRef] = Field(min_length=1)
+    description: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _unique_zone_nos(self) -> "BaselineCreate":
+        seen: set[int] = set()
+        for ref in self.zones:
+            if ref.zone_no in seen:
+                raise ValueError(f"禁区编号 {ref.zone_no} 在基线中重复")
+            seen.add(ref.zone_no)
+        return self
+
+
+class BaselineOut(BaseModel):
+    """机床基线的一个不可变版本：基线版本与固定禁区清单。"""
+    machine_no: str
+    version: int
+    zones: list[ZoneRef] = Field(description="固化的禁区编号+明确版本清单")
+    description: str | None
+    created_at: datetime
+
+
+class BaselineSummaryOut(BaseModel):
+    """机床基线概览：当前（最大）版本号与最近修订时间。"""
+    machine_no: str
+    current_version: int
+    created_at: datetime
+
+
+class BaselineDetailOut(BaseModel):
+    """某机床的全部基线版本（旧版本永久保留可查询）。"""
+    machine_no: str
+    current_version: int
+    versions: list[BaselineOut]
+
+
 class ReviewParamsBase(BaseModel):
-    """审查参数基类：禁区版本引用、初始刀尖、刀半径、可选净间隙/多刀。
+    """审查参数基类：禁区引用（zones 直传或机床基线）、初始刀尖、刀半径、
+    可选净间隙/多刀。
 
     POST /reviews 与分块上传会话创建（POST /uploads）共用同一套校验，
     保证两种提交方式的审查口径完全一致。
     """
-    zones: list[ZoneRef] = Field(min_length=1)
+    # zones 与 baseline 必须且只能提供其一（见下方校验）：
+    # zones 直传禁区编号+明确版本；baseline 以 机床编号+基线版本 引用
+    # 已核准的禁区组合，审查时解析为该基线版本固化的禁区版本快照
+    zones: list[ZoneRef] | None = Field(default=None, min_length=1)
+    baseline: BaselineRef | None = None
     start: tuple[float, float, float]
     tool_radius: float = Field(ge=0.0)
     # 可选：启用后计算全程最小水平净间隙并随报告固化
@@ -95,6 +154,16 @@ class ReviewParamsBase(BaseModel):
     # 传入（含空映射）即启用：初始刀位仍用 tool_radius，G-code 中 Tn 切换；
     # 不传时 T 被忽略，保持单刀旧行为。
     tool_radii: dict[int, float] | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_zone_source(self) -> "ReviewParamsBase":
+        if self.zones is None and self.baseline is None:
+            raise ValueError(
+                "必须提供 zones 或 baseline（机床编号+基线版本）之一")
+        if self.zones is not None and self.baseline is not None:
+            raise ValueError(
+                "zones 与 baseline（机床编号+基线版本）不可同时提供")
+        return self
 
     @field_validator("include_min_clearance", mode="before")
     @classmethod
@@ -225,9 +294,6 @@ class ReviewResponse(BaseModel):
 
 # ---------- 批量审查 ----------
 
-# 批次/任务标识：字母数字开头，可含 _ . : -，最长 64
-_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$"
-
 
 class BatchReviewItem(ReviewRequest):
     """批量审查中的单项任务：完整单项审查输入 + 可选批内唯一任务标识。"""
@@ -281,8 +347,9 @@ MAX_CHUNK_COUNT = MAX_TOTAL_BYTES
 class UploadSessionCreate(ReviewParamsBase):
     """创建分块上传会话：冻结审查参数（同 POST /reviews，缺 gcode）。
 
-    禁区编号 + 明确版本、初始刀尖坐标、刀半径与可选多刀/最小净间隙
-    设置在创建时固定并落库；G-code 随后以分块方式提交。
+    禁区编号 + 明确版本（zones 直传或 机床编号+基线版本）、初始刀尖坐标、
+    刀半径与可选多刀/最小净间隙设置在创建时固定并落库；
+    G-code 随后以分块方式提交。
     """
 
 

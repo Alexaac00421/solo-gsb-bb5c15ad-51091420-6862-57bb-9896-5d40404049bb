@@ -296,3 +296,74 @@ printf 'G1 X15 Y50 Z0\n' | curl -s -X PUT "$BASE/uploads/$SID2/chunks/0" --data-
 curl -s -X POST "$BASE/uploads/$SID2/complete" \
   -H 'Content-Type: application/json' \
   -d '{"chunk_count": 2, "sha256": "'$(printf 'G1 X15 Y50 Z0\n' | sha256sum | cut -d' ' -f1)'"}'; echo
+
+echo "== 27) 机床禁区基线：提交 MC-01 首版（版本 1），返回基线版本与固定禁区清单 =="
+# 按机床编号固化一组互不重复的禁区编号+明确版本；组内编号重复 422、
+# 禁区或版本不存在 404，且不写入基线
+curl -s -X POST "$BASE/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "machine_no": "MC-01",
+        "zones": [{"zone_no": 1, "version": 1}],
+        "description": "已核准的基座组合"
+      }'; echo
+
+echo "== 28) 用 机床编号+基线版本 代替 zones 提交审查（与直传 zones 同口径） =="
+# 审查时解析为该基线版本固化的禁区版本快照；报告继续固化 used_zone_versions
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "baseline": {"machine_no": "MC-01", "version": 1},
+        "start": [-5, 5, 0],
+        "tool_radius": 0.0,
+        "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n"
+      }'; echo
+
+echo "== 29) 修订基线 => 递增不可变新版本（引用禁区 1 的 v2），旧版仍可查询 =="
+curl -s -X POST "$BASE/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "machine_no": "MC-01",
+        "zones": [{"zone_no": 1, "version": 2}]
+      }'; echo
+curl -s "$BASE/baselines/MC-01"; echo
+
+echo "== 30) 基线快照不可变：v1 仍按禁区 v1 判定（碰撞），v2 按 v2（无碰撞） =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-01", "version": 1}, "start": [-5, 5, 0],
+       "tool_radius": 0.0, "gcode": "G1 X15 Y5 Z0\n"}'; echo
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-01", "version": 2}, "start": [-5, 5, 0],
+       "tool_radius": 0.0, "gcode": "G1 X15 Y5 Z0\n"}'; echo
+
+echo "== 31) 批量任务与分块上传建会话同样可用 baseline；zones 与 baseline 同传 422 =="
+curl -s -X POST "$BASE/reviews/batch" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_id": "BL-20261006-001",
+        "items": [
+          {"task_id": "via-baseline",
+           "baseline": {"machine_no": "MC-01", "version": 1},
+           "start": [-5, 5, 0], "tool_radius": 0.0,
+           "gcode": "G1 X15 Y5 Z0\n"},
+          {"task_id": "via-zones",
+           "zones": [{"zone_no": 1, "version": 2}],
+           "start": [-5, 5, 0], "tool_radius": 0.0,
+           "gcode": "G1 X15 Y5 Z0\n"}
+        ]
+      }'; echo
+SID3=$(curl -s -X POST "$BASE/uploads" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-01", "version": 1}, "start": [-5, 5, 0],
+       "tool_radius": 0.0}' | sed -n 's/.*"session_id":"\([0-9a-f]*\)".*/\1/p')
+printf 'G1 X15 Y5 Z0\n' | curl -s -X PUT "$BASE/uploads/$SID3/chunks/0" --data-binary @- > /dev/null
+curl -s -X POST "$BASE/uploads/$SID3/complete" \
+  -H 'Content-Type: application/json' \
+  -d '{"chunk_count": 1, "sha256": "'$(printf 'G1 X15 Y5 Z0\n' | sha256sum | cut -d' ' -f1)'"}'; echo
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"zones": [{"zone_no": 1, "version": 1}],
+       "baseline": {"machine_no": "MC-01", "version": 1},
+       "start": [-5, 5, 0], "tool_radius": 0.0, "gcode": "G1 X1\n"}'
