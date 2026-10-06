@@ -296,3 +296,55 @@ printf 'G1 X15 Y50 Z0\n' | curl -s -X PUT "$BASE/uploads/$SID2/chunks/0" --data-
 curl -s -X POST "$BASE/uploads/$SID2/complete" \
   -H 'Content-Type: application/json' \
   -d '{"chunk_count": 2, "sha256": "'$(printf 'G1 X15 Y50 Z0\n' | sha256sum | cut -d' ' -f1)'"}'; echo
+
+echo "== 27) 机床禁区组合基线：首版 1（返回版本与固定禁区清单） =="
+# 用机床编号 + 一组互不重复的禁区编号/明确版本提交；旧用法 zones 完全不受影响
+curl -s -X POST "$BASE/machines/CNC-01/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{"zones": [{"zone_no": 1, "version": 1}]}'; echo
+
+echo "== 28) 用「机床编号+基线版本」代替 zones 提交审查 =="
+# 审查时解析为基线 v1 固定的禁区版本快照；报告仍固化 used_zone_versions
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "machine_no": "CNC-01",
+        "baseline_version": 1,
+        "start": [-5, 5, 0],
+        "tool_radius": 0.0,
+        "gcode": "G1 X15 Y5 Z0\n"
+      }'; echo
+
+echo "== 29) 修订基线：产生递增不可变新版本，旧版仍可查询 =="
+curl -s -X POST "$BASE/machines/CNC-01/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{"zones": [{"zone_no": 1, "version": 1}]}'; echo
+curl -s "$BASE/machines/CNC-01/baselines"; echo
+curl -s "$BASE/machines/CNC-01/baselines/1"; echo
+
+echo "== 30) 基线引用与 zones 同传 / 基线不存在 / 组内编号重复：一律拒绝 =="
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"zones": [{"zone_no": 1, "version": 1}],
+       "machine_no": "CNC-01", "baseline_version": 1,
+       "start": [-5, 5, 0], "tool_radius": 0.0, "gcode": "G1 X1\n"}'
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"machine_no": "CNC-01", "baseline_version": 99,
+       "start": [-5, 5, 0], "tool_radius": 0.0, "gcode": "G1 X1\n"}'
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/machines/CNC-02/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{"zones": [{"zone_no": 1, "version": 1}, {"zone_no": 1, "version": 1}]}'
+
+echo "== 31) 分块上传建会话同样可用机床基线（建会话时即冻结为明确版本快照） =="
+SID3=$(curl -s -X POST "$BASE/uploads" \
+  -H 'Content-Type: application/json' \
+  -d '{"machine_no": "CNC-01", "baseline_version": 1,
+       "start": [-5, 5, 0], "tool_radius": 0.0}' \
+  | sed -n 's/.*"session_id":"\([0-9a-f]*\)".*/\1/p')
+# 会话参数 params.zones 即基线解析结果（不含 machine_no/baseline_version）
+curl -s "$BASE/uploads/$SID3"; echo
+printf 'G1 X15 Y5 Z0\n' | curl -s -X PUT "$BASE/uploads/$SID3/chunks/0" --data-binary @- > /dev/null
+curl -s -X POST "$BASE/uploads/$SID3/complete" \
+  -H 'Content-Type: application/json' \
+  -d '{"chunk_count": 1, "sha256": "'$(printf 'G1 X15 Y5 Z0\n' | sha256sum | cut -d' ' -f1)'"}'; echo

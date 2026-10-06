@@ -19,18 +19,24 @@ from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
-from .models import Batch, Report, UploadChunk, UploadSession, ZoneVersion
+from .models import (Batch, Machine, Report, UploadChunk, UploadSession,
+                     ZoneBaseline, ZoneVersion)
 from .schemas import (MAX_CHUNK_BYTES, MAX_CHUNK_COUNT, MAX_TOTAL_BYTES,
-                      BatchItemResult, BatchReviewRequest, BatchReviewResponse,
-                      ChunkReceipt, MinClearanceOut, ReviewRequest,
+                      BaselineCreate, BaselineOut, BatchItemResult,
+                      BatchReviewRequest, BatchReviewResponse, ChunkReceipt,
+                      MachineOut, MinClearanceOut, ReviewRequest,
                       ReviewResponse, TraceEventOut, UploadCompleteRequest,
                       UploadSessionCreate, UploadSessionOut, ZoneCreate,
-                      ZoneDetailOut, ZoneOut, ZoneVersionCreate, ZoneVersionOut)
+                      ZoneDetailOut, ZoneOut, ZoneRef, ZoneVersionCreate,
+                      ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.5.0",
+    version="1.6.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
+                "按机床登记不可变禁区组合基线（/machines：首版 1，"
+                "修订产生递增不可变新版本，单项审查/批量/分块上传可用"
+                "机床编号+基线版本代替 zones，审查时解析为禁区版本快照），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
                 "可选多刀半径映射（tool_radii：刀号到毫米半径），"
@@ -46,8 +52,8 @@ app = FastAPI(
 @app.on_event("startup")
 def on_startup() -> None:
     # 容器内由应用直接完成数据库初始化（表结构创建；v1.4 新增 batches 表、
-    # v1.5 新增 upload_sessions / upload_chunks 表，对旧库同样由
-    # create_all 幂等建出）
+    # v1.5 新增 upload_sessions / upload_chunks 表，v1.6 新增 machines /
+    # zone_baselines 机床禁区组合基线表，对旧库同样由 create_all 幂等建出）
     Base.metadata.create_all(bind=engine)
     # 旧库 reports 表缺少后续版本新增列：幂等补齐，保证旧请求/旧报告仍可读写
     _ensure_report_columns(engine)
@@ -184,6 +190,191 @@ def add_zone_version(zone_no: int, payload: ZoneVersionCreate,
                           created_at=ver.created_at)
 
 
+# ---------- 机床禁区组合基线 ----------
+
+def _baseline_refs(db: Session, machine_no: str,
+                   version: int) -> list[dict[str, int]]:
+    """解析机床基线为固定禁区版本引用 [{zone_no, version}, ...]。
+
+    基线本身不可变，引用的也是禁区的明确版本；后续禁区再出新版本、
+    机床再出新基线都不影响本解析结果。机床/基线版本不存在 => 404。
+    """
+    baseline = db.scalar(
+        select(ZoneBaseline)
+        .join(Machine, Machine.id == ZoneBaseline.machine_id)
+        .where(Machine.machine_no == machine_no,
+               ZoneBaseline.version == version))
+    if baseline is None:
+        machine = db.scalar(select(Machine).where(
+            Machine.machine_no == machine_no))
+        if machine is None:
+            raise HTTPException(status_code=404,
+                                detail=f"机床 {machine_no} 不存在")
+        raise HTTPException(status_code=404,
+                            detail=f"机床 {machine_no} 不存在基线版本 {version}")
+    return [{"zone_no": int(r["zone_no"]), "version": int(r["version"])}
+            for r in baseline.zones]
+
+
+def _resolve_refs(db: Session, payload) -> list[dict[str, int]]:
+    """取得本次审查/建会话实际使用的禁区版本引用。
+
+    - zones 用法：原样返回（明确版本，组内重复由 _load_zones 拒绝）；
+    - 机床基线用法：解析为基线固化的固定禁区清单快照（按编号升序，
+      天然互不重复）。
+    """
+    if payload.zones:
+        return [{"zone_no": ref.zone_no, "version": ref.version}
+                for ref in payload.zones]
+    return _baseline_refs(db, payload.machine_no, payload.baseline_version)
+
+
+def _baseline_out(b: ZoneBaseline) -> BaselineOut:
+    return BaselineOut(
+        machine_no=b.machine_no, version=b.version,
+        zones=[ZoneRef(zone_no=int(r["zone_no"]), version=int(r["version"]))
+               for r in b.zones],
+        created_at=b.created_at)
+
+
+@app.get("/machines", response_model=list[MachineOut],
+         summary="列出全部机床及其当前基线版本")
+def list_machines(db: Session = Depends(get_db)) -> list[MachineOut]:
+    rows = db.scalars(select(Machine).order_by(Machine.machine_no)).all()
+    return [MachineOut(machine_no=m.machine_no,
+                       current_version=m.current_version,
+                       created_at=m.created_at) for m in rows]
+
+
+@app.get("/machines/{machine_no}/baselines",
+         response_model=list[BaselineOut],
+         summary="查询机床的全部不可变基线版本（旧版永久可查）")
+def list_machine_baselines(
+        machine_no: str = Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                               max_length=64),
+        db: Session = Depends(get_db)) -> list[BaselineOut]:
+    machine = db.scalar(select(Machine).where(
+        Machine.machine_no == machine_no))
+    if machine is None:
+        raise HTTPException(status_code=404,
+                            detail=f"机床 {machine_no} 不存在")
+    rows = db.scalars(
+        select(ZoneBaseline).where(ZoneBaseline.machine_id == machine.id)
+        .order_by(ZoneBaseline.version)).all()
+    return [_baseline_out(b) for b in rows]
+
+
+@app.get("/machines/{machine_no}/baselines/{version}",
+         response_model=BaselineOut,
+         summary="查询机床指定版本基线（返回版本号与固定禁区清单）")
+def get_machine_baseline(
+        machine_no: str = Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                               max_length=64),
+        version: int = Path(ge=1),
+        db: Session = Depends(get_db)) -> BaselineOut:
+    baseline = db.scalar(
+        select(ZoneBaseline)
+        .join(Machine, Machine.id == ZoneBaseline.machine_id)
+        .where(Machine.machine_no == machine_no,
+               ZoneBaseline.version == version))
+    if baseline is None:
+        machine = db.scalar(select(Machine).where(
+            Machine.machine_no == machine_no))
+        if machine is None:
+            raise HTTPException(status_code=404,
+                                detail=f"机床 {machine_no} 不存在")
+        raise HTTPException(status_code=404,
+                            detail=f"机床 {machine_no} 不存在基线版本 {version}")
+    return _baseline_out(baseline)
+
+
+@app.post("/machines/{machine_no}/baselines", response_model=BaselineOut,
+          status_code=201,
+          summary="提交/修订机床禁区组合基线（首版为 1，修订产生不可变新版本）")
+def create_machine_baseline(
+        payload: BaselineCreate,
+        machine_no: str = Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+                               max_length=64),
+        db: Session = Depends(get_db)) -> BaselineOut:
+    # 写库前完成全部引用校验：组内编号重复（模型已拦一次，此处兜底）、
+    # 禁区或禁区版本不存在一律拒绝，不写入基线
+    refs = [{"zone_no": ref.zone_no, "version": ref.version}
+            for ref in payload.zones]
+    seen: set[int] = set()
+    for ref in refs:
+        if ref["zone_no"] in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=f"禁区编号 {ref['zone_no']} 在基线组内重复")
+        seen.add(ref["zone_no"])
+        zone = db.scalar(select(models.Zone).where(
+            models.Zone.zone_no == ref["zone_no"]))
+        if zone is None:
+            raise HTTPException(status_code=404,
+                                detail=f"禁区 {ref['zone_no']} 不存在")
+        zv = db.scalar(select(ZoneVersion).where(
+            ZoneVersion.zone_id == zone.id,
+            ZoneVersion.version == ref["version"]))
+        if zv is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"禁区 {ref['zone_no']} 不存在版本 {ref['version']}")
+    refs.sort(key=lambda r: r["zone_no"])
+
+    # 并发修订同一机床：写优先原子推进版本序列。
+    # 已有机床 => 条件 UPDATE 取得行锁并 current_version+1（新值即新版本号），
+    # 并发修订在 PostgreSQL 行锁 / SQLite 库锁下串行，各获不同版本；
+    # 首版 => 插入 current_version=1 的机床行，并发首版由唯一约束兜底。
+    res = db.execute(
+        update(Machine)
+        .where(Machine.machine_no == machine_no)
+        .values(current_version=Machine.current_version + 1)
+        .execution_options(synchronize_session="fetch"))
+    if res.rowcount == 1:
+        machine = db.scalar(select(Machine).where(
+            Machine.machine_no == machine_no))
+        new_version = machine.current_version
+        machine_id = machine.id
+    else:
+        db.rollback()
+        try:
+            machine = Machine(machine_no=machine_no, current_version=1)
+            db.add(machine)
+            db.flush()
+        except IntegrityError:
+            # 并发首版：另一请求已插入机床行 => 回滚后转为原子推进，
+            # 等待其提交后取得下一个版本号，不丢失任何成功提交
+            db.rollback()
+            res = db.execute(
+                update(Machine)
+                .where(Machine.machine_no == machine_no)
+                .values(current_version=Machine.current_version + 1)
+                .execution_options(synchronize_session="fetch"))
+            if res.rowcount != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"机床 {machine_no} 基线版本分配冲突，请重试")
+            machine = db.scalar(select(Machine).where(
+                Machine.machine_no == machine_no))
+        new_version = machine.current_version
+        machine_id = machine.id
+
+    baseline = ZoneBaseline(machine_id=machine_id, machine_no=machine_no,
+                            version=new_version, zones=refs)
+    db.add(baseline)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 唯一约束兜底（极端并发）：本次不写入，提示客户端重试
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"机床 {machine_no} 基线版本 {new_version} 提交冲突，"
+                   "请重试")
+    db.refresh(baseline)
+    return _baseline_out(baseline)
+
+
 # ---------- 审查 ----------
 
 def _load_zones(db: Session, refs) -> tuple[list[Zone], dict[str, int], dict[int, int]]:
@@ -192,26 +383,28 @@ def _load_zones(db: Session, refs) -> tuple[list[Zone], dict[str, int], dict[int
     version_ids: dict[int, int] = {}
     seen: set[int] = set()
     for ref in refs:
-        if ref.zone_no in seen:
+        zone_no = ref["zone_no"] if isinstance(ref, dict) else ref.zone_no
+        ref_version = ref["version"] if isinstance(ref, dict) else ref.version
+        if zone_no in seen:
             raise HTTPException(status_code=422,
-                                detail=f"禁区 {ref.zone_no} 在请求中重复")
-        seen.add(ref.zone_no)
+                                detail=f"禁区 {zone_no} 在请求中重复")
+        seen.add(zone_no)
         zone = db.scalar(select(models.Zone).where(
-            models.Zone.zone_no == ref.zone_no))
+            models.Zone.zone_no == zone_no))
         if zone is None:
             raise HTTPException(status_code=404,
-                                detail=f"禁区 {ref.zone_no} 不存在")
+                                detail=f"禁区 {zone_no} 不存在")
         zv = db.scalar(select(ZoneVersion).where(
             ZoneVersion.zone_id == zone.id,
-            ZoneVersion.version == ref.version))
+            ZoneVersion.version == ref_version))
         if zv is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"禁区 {ref.zone_no} 不存在版本 {ref.version}")
+                detail=f"禁区 {zone_no} 不存在版本 {ref_version}")
         polygon = normalize_polygon(zv.polygon)  # 防御性再校验
-        zones.append(Zone(ref.zone_no, polygon, zv.z_min, zv.z_max))
-        used[str(ref.zone_no)] = ref.version
-        version_ids[ref.zone_no] = zv.id
+        zones.append(Zone(zone_no, polygon, zv.z_min, zv.z_max))
+        used[str(zone_no)] = ref_version
+        version_ids[zone_no] = zv.id
     zones.sort(key=lambda z: z.zone_no)
     return zones, used, version_ids
 
@@ -226,8 +419,10 @@ def _build_review(db: Session, payload: ReviewRequest) -> ReviewResponse:
     if payload.tool_radius < 0:
         raise HTTPException(status_code=422, detail="刀具半径不得为负")
 
-    # 先加载并固化所用禁区版本；任何非法输入都在写报告之前拒绝
-    zones, used_versions, _ = _load_zones(db, payload.zones)
+    # 先加载并固化所用禁区版本；任何非法输入都在写报告之前拒绝。
+    # zones 或「机床编号+基线版本」二选一：基线先解析为固定禁区版本快照
+    refs = _resolve_refs(db, payload)
+    zones, used_versions, _ = _load_zones(db, refs)
 
     tool_map = payload.tool_radii
     multi_tool = tool_map is not None
@@ -511,11 +706,17 @@ def _chunk_receipt(session_id: str, seq: int, byte_len: int,
           summary="创建分块上传会话（冻结审查参数，返回会话标识）")
 def create_upload_session(payload: UploadSessionCreate,
                           db: Session = Depends(get_db)) -> UploadSessionOut:
-    # 创建时即校验禁区编号与明确版本存在（404/422 口径同 POST /reviews）；
-    # 版本几何不可变，完成时按同一编号+版本重载，结果一致
-    _load_zones(db, payload.zones)
+    # 创建时即解析并校验禁区引用（404/422 口径同 POST /reviews）：
+    # zones 或「机床编号+基线版本」二选一；基线在建会话时解析为固定
+    # 禁区版本快照，随后机床再修订基线、禁区再出新版本均不影响本会话，
+    # 完成时沿用该快照（params 固化解析后的 zones，完成不再依赖基线）
+    refs = _resolve_refs(db, payload)
+    _load_zones(db, refs)
+    stored = payload.model_dump(mode="json",
+                                exclude={"machine_no", "baseline_version"})
+    stored["zones"] = refs
     session = UploadSession(session_id=uuid4().hex, status="open",
-                            params=payload.model_dump(mode="json"))
+                            params=stored)
     db.add(session)
     db.commit()
     db.refresh(session)

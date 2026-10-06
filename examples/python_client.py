@@ -345,6 +345,77 @@ def main() -> None:
     print("incomplete upload rejected, session stays open:",
           c.get(f"/uploads/{sess2}").json()["status"])
 
+    # 13. 机床禁区组合基线（/machines）：按机床编号提交一组互不重复的
+    #     禁区编号+明确版本，首版为 1，修订产生递增不可变新版本，旧版可查；
+    #     单项审查/批量/分块上传建会话可用「机床编号+基线版本」代替 zones，
+    #     审查时解析为禁区版本快照，报告继续固化 used_zone_versions。
+    b1 = c.post("/machines/CNC-01/baselines", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+    })
+    b1.raise_for_status()  # 201
+    assert b1.json()["version"] == 1
+    assert b1.json()["zones"] == [{"zone_no": 1, "version": 1}]
+    print("baseline v1:", b1.json())
+
+    # 用「机床编号+基线版本」提交审查（与 zones 二选一，不可同传）
+    br = c.post("/reviews", json={
+        "machine_no": "CNC-01", "baseline_version": 1,
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X15 Y5 Z0\n",
+    })
+    br.raise_for_status()
+    body = br.json()
+    assert body["has_collision"]
+    assert body["used_zone_versions"] == {"1": 1}
+    print("review by baseline:", body["conclusion"],
+          body["used_zone_versions"])
+
+    # 修订产生不可变新版本；旧版仍可查询且结论不变
+    b2 = c.post("/machines/CNC-01/baselines", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+    })
+    assert b2.status_code == 201 and b2.json()["version"] == 2
+    versions = [b["version"]
+                for b in c.get("/machines/CNC-01/baselines").json()]
+    assert versions == [1, 2]
+    assert c.get("/machines/CNC-01/baselines/1").json()["zones"] == [
+        {"zone_no": 1, "version": 1}]
+
+    # 拒绝：zones 与基线同传 / 基线版本不存在 / 组内编号重复
+    assert c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "machine_no": "CNC-01", "baseline_version": 1,
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X1\n"}).status_code == 422
+    assert c.post("/reviews", json={
+        "machine_no": "CNC-01", "baseline_version": 99,
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X1\n"}).status_code == 404
+    dup = c.post("/machines/CNC-02/baselines", json={"zones": [
+        {"zone_no": 1, "version": 1}, {"zone_no": 1, "version": 1}]})
+    assert dup.status_code == 422
+    print("baseline validation ok (422/404 as expected)")
+
+    # 分块上传建会话同样可用基线：建会话时即冻结为明确版本快照，
+    # params.zones 为解析结果，完成沿用该快照
+    bsess = c.post("/uploads", json={
+        "machine_no": "CNC-01", "baseline_version": 1,
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.0,
+    })
+    bsess.raise_for_status()
+    bsid = bsess.json()["session_id"]
+    assert bsess.json()["params"]["zones"] == [{"zone_no": 1, "version": 1}]
+    assert "machine_no" not in bsess.json()["params"]
+    c.put(f"/uploads/{bsid}/chunks/0", content=b"G1 X15 Y5 Z0\n").raise_for_status()
+    bdone = c.post(f"/uploads/{bsid}/complete", json={
+        "chunk_count": 1,
+        "sha256": hashlib.sha256(b"G1 X15 Y5 Z0\n").hexdigest(),
+    })
+    assert bdone.status_code == 201
+    assert bdone.json()["used_zone_versions"] == {"1": 1}
+    print("upload by baseline completed: report",
+          bdone.json()["report_id"], bdone.json()["conclusion"])
+
 
 if __name__ == "__main__":
     main()

@@ -2,6 +2,9 @@
 
 - zones：禁区逻辑实体（编号唯一）；
 - zone_versions：禁区的不可变版本，每次修改产生新版本，旧版本保留；
+- machines：机床逻辑实体（机床编号唯一），current_version 为基线版本序列；
+- zone_baselines：按机床复用的禁区组合基线，每次修订产生递增不可变新版本，
+  旧版本永久保留，zones 固化当时提交的 {zone_no, version} 引用；
 - reports：审查报告，创建后不可变，不随后续禁区版本变化；
 - batches：批量审查批次（batch_id 幂等键 + 内容哈希 + 逐项结果快照）；
 - upload_sessions / upload_chunks：长 G-code 可恢复分块上传会话及其文本块，
@@ -51,6 +54,49 @@ class ZoneVersion(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     zone = relationship("Zone", back_populates="versions")
+
+
+class Machine(Base):
+    """机床逻辑实体（机床编号唯一）。
+
+    current_version 为该机床已成功提交的基线版本序列（首版为 1）。
+    并发修订同一机床时通过行上写锁原子推进 current_version，
+    每个成功提交各获不同版本，不丢失任何版本。
+    """
+
+    __tablename__ = "machines"
+
+    id = Column(Integer, primary_key=True)
+    machine_no = Column(String(64), nullable=False, unique=True)
+    current_version = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class ZoneBaseline(Base):
+    """机床禁区组合基线：提交即不可变，修订不改旧版本。
+
+    每次提交（含首版）在同一事务中：写优先原子推进 machines.current_version
+    并按其新值生成本版本；zones 固化提交时的明确禁区版本引用
+    [{zone_no, version}, ...]（按禁区编号升序）。
+    后续禁区再出新版本不改变任何旧基线；审查/上传会话解析基线时
+    读取本快照中的引用，再解析为对应禁区版本快照。
+    """
+
+    __tablename__ = "zone_baselines"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_baseline_version_positive"),
+        Index("ix_baseline_machine_version", "machine_id", "version",
+              unique=True),
+    )
+
+    id = Column(Integer, primary_key=True)
+    machine_id = Column(Integer, ForeignKey("machines.id"), nullable=False)
+    # 冗余机床编号，便于直接按编号查询与对外展示
+    machine_no = Column(String(64), nullable=False)
+    version = Column(Integer, nullable=False)
+    # 固定禁区清单（明确版本引用）：[{zone_no, version}, ...]，按 zone_no 升序
+    zones = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class Report(Base):

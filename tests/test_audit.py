@@ -1586,6 +1586,292 @@ class UploadSessionApiTests(unittest.TestCase):
         self.assertEqual(self._last_report_id(), last_id + 2)
 
 
+class BaselineApiTests(unittest.TestCase):
+    """机床禁区组合基线（v1.6）：
+
+    首版 1、修订产生递增不可变新版本、旧版可查；组内编号重复/
+    引用的禁区或版本不存在拒绝且不写基线；单项审查/批量/分块上传
+    可用「机床编号+基线版本」代替 zones，审查解析为禁区版本快照，
+    报告固化 used_zone_versions，上传完成沿用建会话快照；
+    并发修订同一机床各获不同版本且不丢失。
+    """
+
+    ZONE_NO = 800
+    ZONE_NO2 = 801
+
+    @classmethod
+    def setUpClass(cls):
+        client.post("/zones", json={"zone_no": cls.ZONE_NO, "polygon": SQUARE,
+                                    "z_min": -5, "z_max": 5})
+        client.post("/zones", json={
+            "zone_no": cls.ZONE_NO2,
+            "polygon": [[20, 0], [30, 0], [30, 10], [20, 10]],
+            "z_min": -5, "z_max": 5})
+
+    def _create_baseline(self, machine, refs, expected=201):
+        r = client.post(f"/machines/{machine}/baselines",
+                        json={"zones": refs})
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _review(self, machine=None, version=None, **kw):
+        body = {"start": [-5, 5, 0], "tool_radius": 0.0,
+                "gcode": "G1 X15 Y5 Z0\n"}
+        if machine is not None:
+            body["machine_no"] = machine
+            body["baseline_version"] = version
+        else:
+            body["zones"] = [{"zone_no": self.ZONE_NO, "version": 1}]
+        body.update(kw)
+        return client.post("/reviews", json=body)
+
+    def test_01_first_revision_and_query(self):
+        m = "M-BASE-01"
+        # 首版为 1，返回基线版本与固定禁区清单（按禁区编号升序）
+        r = self._create_baseline(m, [
+            {"zone_no": self.ZONE_NO2, "version": 1},
+            {"zone_no": self.ZONE_NO, "version": 1}])
+        b = r.json()
+        self.assertEqual(b["version"], 1)
+        self.assertEqual(b["machine_no"], m)
+        self.assertEqual(b["zones"], [
+            {"zone_no": self.ZONE_NO, "version": 1},
+            {"zone_no": self.ZONE_NO2, "version": 1}])
+
+        # 修订：版本递增、不可变；旧版仍可查询
+        r = self._create_baseline(m,
+                                  [{"zone_no": self.ZONE_NO, "version": 1}])
+        self.assertEqual(r.json()["version"], 2)
+        self.assertEqual(r.json()["zones"],
+                         [{"zone_no": self.ZONE_NO, "version": 1}])
+        rows = client.get(f"/machines/{m}/baselines").json()
+        self.assertEqual([x["version"] for x in rows], [1, 2])
+        old = client.get(f"/machines/{m}/baselines/1").json()
+        self.assertEqual(old["zones"], [
+            {"zone_no": self.ZONE_NO, "version": 1},
+            {"zone_no": self.ZONE_NO2, "version": 1}])
+        # 机床列表含当前版本
+        machines = {x["machine_no"]: x for x in client.get("/machines").json()}
+        self.assertIn(m, machines)
+        self.assertEqual(machines[m]["current_version"], 2)
+
+    def test_02_duplicate_zone_no_rejected_without_writing(self):
+        # 组内编号重复 => 422，且不写入基线（机床亦不创建）
+        r = client.post("/machines/M-BASE-02/baselines", json={"zones": [
+            {"zone_no": self.ZONE_NO, "version": 1},
+            {"zone_no": self.ZONE_NO, "version": 1}]})
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(client.get("/machines/M-BASE-02/baselines").status_code,
+                         404)
+        machines = {x["machine_no"] for x in client.get("/machines").json()}
+        self.assertNotIn("M-BASE-02", machines)
+        # 空清单同样 422
+        self.assertEqual(client.post("/machines/M-BASE-02/baselines",
+                                     json={"zones": []}).status_code, 422)
+
+    def test_03_missing_zone_or_version_rejected(self):
+        r = self._create_baseline("M-BASE-03",
+                                  [{"zone_no": 999001, "version": 1}], 404)
+        self.assertIn("不存在", r.text)
+        r = self._create_baseline("M-BASE-03",
+                                  [{"zone_no": self.ZONE_NO, "version": 99}],
+                                  404)
+        self.assertIn("不存在版本", r.text)
+        # 失败不创建机床
+        self.assertEqual(
+            client.get("/machines/M-BASE-03/baselines").status_code, 404)
+
+    def test_04_baseline_not_found(self):
+        self.assertEqual(client.get("/machines/NOPE-9/baselines").status_code,
+                         404)
+        self.assertEqual(
+            client.get("/machines/NOPE-9/baselines/1").status_code, 404)
+        self._create_baseline("M-BASE-04",
+                              [{"zone_no": self.ZONE_NO, "version": 1}])
+        self.assertEqual(
+            client.get("/machines/M-BASE-04/baselines/9").status_code, 404)
+
+    def test_05_review_resolves_baseline_snapshot(self):
+        m = "M-BASE-05"
+        self._create_baseline(m, [
+            {"zone_no": self.ZONE_NO, "version": 1}])
+        # 「机床编号+基线版本」代替 zones：审查解析为对应禁区版本快照
+        r = self._review(m, 1)
+        self.assertEqual(r.status_code, 200, r.text)
+        b = r.json()
+        self.assertTrue(b["has_collision"])
+        self.assertEqual(b["collision_zone_no"], self.ZONE_NO)
+        # 报告继续固化 used_zone_versions（实际禁区编号 -> 版本）
+        self.assertEqual(b["used_zone_versions"], {str(self.ZONE_NO): 1})
+
+        # 禁区出 v2（平移到远处）：旧基线仍指向 v1，审查结论不变
+        client.post(f"/zones/{self.ZONE_NO}/versions", json={
+            "polygon": [[100, 100], [110, 100], [110, 110], [100, 110]],
+            "z_min": -5, "z_max": 5})
+        r = self._review(m, 1)
+        self.assertTrue(r.json()["has_collision"])
+        self.assertEqual(r.json()["used_zone_versions"],
+                         {str(self.ZONE_NO): 1})
+        # 新基线引用 v2 => 无碰撞、used_zone_versions 固化 v2
+        self._create_baseline(m,
+                              [{"zone_no": self.ZONE_NO, "version": 2}])
+        r = self._review(m, 2)
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["has_collision"])
+        self.assertEqual(r.json()["used_zone_versions"],
+                         {str(self.ZONE_NO): 2})
+
+    def test_06_review_baseline_validation(self):
+        self._create_baseline("M-BASE-06",
+                              [{"zone_no": self.ZONE_NO, "version": 1}])
+        # zones 与基线引用同传 => 422，不留报告
+        last = self._review()
+        self.assertEqual(last.status_code, 200)
+        last_id = last.json()["report_id"]
+        bad = (
+            {"zones": [{"zone_no": self.ZONE_NO, "version": 1}],
+             "machine_no": "M-BASE-06", "baseline_version": 1},
+            {},  # 二者均不给
+            {"machine_no": "M-BASE-06"},          # 只给机床编号
+            {"baseline_version": 1},              # 只给基线版本
+            {"machine_no": "bad id!", "baseline_version": 1},
+        )
+        for extra in bad:
+            body = {"start": [-5, 5, 0], "tool_radius": 0.0,
+                    "gcode": "G1 X15 Y5 Z0\n"}
+            body.update(extra)
+            r = client.post("/reviews", json=body)
+            self.assertEqual(r.status_code, 422, (extra, r.text))
+        # 基线机床/版本不存在 => 404
+        r = self._review("NOPE-9", 1)
+        self.assertEqual(r.status_code, 404)
+        r = self._review("M-BASE-06", 99)
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(client.get(f"/reports/{last_id + 1}").status_code,
+                         404)
+
+    def test_07_batch_items_can_use_baseline(self):
+        m = "M-BASE-07"
+        self._create_baseline(m, [
+            {"zone_no": self.ZONE_NO, "version": 1},
+            {"zone_no": self.ZONE_NO2, "version": 1}])
+        items = [
+            {"machine_no": m, "baseline_version": 1,
+             "start": [-5, 5, 0], "tool_radius": 0.0,
+             "gcode": "G1 X15 Y5 Z0\n", "task_id": "by-baseline"},
+            {"zones": [{"zone_no": self.ZONE_NO2, "version": 1}],
+             "start": [-5, 50, 0], "tool_radius": 0.0,
+             "gcode": "G1 X15 Y50 Z0\n", "task_id": "by-zones"},
+        ]
+        r = client.post("/reviews/batch",
+                        json={"batch_id": "B-BASE-07", "items": items})
+        self.assertEqual(r.status_code, 201, r.text)
+        res = r.json()["results"]
+        self.assertTrue(res[0]["result"]["has_collision"])
+        self.assertEqual(res[0]["result"]["used_zone_versions"],
+                         {str(self.ZONE_NO): 1, str(self.ZONE_NO2): 1})
+        self.assertFalse(res[1]["result"]["has_collision"])
+
+        # 批内任一项基线非法 => 整批不落报告，逐项错误列出
+        ok = client.post("/reviews", json={
+            "zones": [{"zone_no": self.ZONE_NO2, "version": 1}],
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"})
+        last_id = ok.json()["report_id"]
+        items_bad = [
+            {"machine_no": m, "baseline_version": 1,
+             "start": [-5, 5, 0], "tool_radius": 0.0,
+             "gcode": "G1 X15 Y5 Z0\n"},
+            {"machine_no": m, "baseline_version": 99,
+             "start": [-5, 5, 0], "tool_radius": 0.0,
+             "gcode": "G1 X15 Y5 Z0\n"},
+        ]
+        r = client.post("/reviews/batch",
+                        json={"batch_id": "B-BASE-07-BAD", "items": items_bad})
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual([f["index"] for f in r.json()["failed_items"]], [1])
+        self.assertEqual(client.get(f"/reports/{last_id + 1}").status_code,
+                         404)
+
+    def test_08_upload_session_freezes_baseline_snapshot(self):
+        m = "M-BASE-08"
+        self._create_baseline(m, [
+            {"zone_no": self.ZONE_NO, "version": 1}])
+        r = client.post("/uploads", json={
+            "machine_no": m, "baseline_version": 1,
+            "start": [-5, 5, 0], "tool_radius": 0.0})
+        self.assertEqual(r.status_code, 201, r.text)
+        sess = r.json()
+        # 建会话时即解析为固定禁区快照，params 中不再保留基线引用
+        self.assertEqual(sess["params"]["zones"],
+                         [{"zone_no": self.ZONE_NO, "version": 1}])
+        self.assertNotIn("machine_no", sess["params"])
+        sid = sess["session_id"]
+        full = "G1 X15 Y5 Z0\n"
+        self.assertEqual(
+            client.put(f"/uploads/{sid}/chunks/0",
+                       content=full.encode("utf-8")).status_code, 201)
+        r = client.post(f"/uploads/{sid}/complete", json={
+            "chunk_count": 1,
+            "sha256": hashlib.sha256(full.encode("utf-8")).hexdigest()})
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        # 完成沿用建会话时的快照：固化 used_zone_versions，按 v1 判碰撞
+        self.assertTrue(body["has_collision"])
+        self.assertEqual(body["used_zone_versions"],
+                         {str(self.ZONE_NO): 1})
+
+        # 基线不存在 => 建会话 404，不产生会话
+        r = client.post("/uploads", json={
+            "machine_no": m, "baseline_version": 99,
+            "start": [-5, 5, 0], "tool_radius": 0.0})
+        self.assertEqual(r.status_code, 404)
+        r = client.post("/uploads", json={
+            "machine_no": "NOPE-9", "baseline_version": 1,
+            "start": [-5, 5, 0], "tool_radius": 0.0})
+        self.assertEqual(r.status_code, 404)
+
+    def test_09_concurrent_revisions_get_distinct_versions(self):
+        import threading
+        m = "M-BASE-09"
+        outcomes: list[tuple[int, int | None]] = []
+        lock = threading.Lock()
+
+        def worker(i):
+            cc = TestClient(app)
+            r = cc.post(f"/machines/{m}/baselines", json={"zones": [
+                {"zone_no": self.ZONE_NO, "version": 1}]})
+            with lock:
+                outcomes.append((r.status_code,
+                                 r.json().get("version") if r.status_code == 201
+                                 else None))
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual([s for s, _ in outcomes], [201] * 6)
+        versions = sorted(v for _, v in outcomes)
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(len(set(versions)), 6)  # 不丢失任何成功提交
+        rows = client.get(f"/machines/{m}/baselines").json()
+        self.assertEqual([b["version"] for b in rows], [1, 2, 3, 4, 5, 6])
+
+    def test_10_legacy_zones_request_still_compatible(self):
+        # 原有 zones 请求、报告字段保持兼容
+        r = client.post("/reviews", json={
+            "zones": [{"zone_no": self.ZONE_NO, "version": 1}],
+            "start": [-5, 5, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y5 Z0\n"})
+        self.assertEqual(r.status_code, 200, r.text)
+        b = r.json()
+        self.assertEqual(b["used_zone_versions"], {str(self.ZONE_NO): 1})
+        got = client.get(f"/reports/{b['report_id']}").json()
+        self.assertEqual(got["used_zone_versions"], b["used_zone_versions"])
+
+
 class SchemaMigrationTests(unittest.TestCase):
     """旧库（缺少 v1.1/v1.2/v1.3 新列）启动时幂等补齐，旧报告读取兼容。"""
 

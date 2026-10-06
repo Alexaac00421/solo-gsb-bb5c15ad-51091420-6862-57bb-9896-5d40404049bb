@@ -8,6 +8,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 
+# 机床/批次/任务标识：字母数字开头，可含 _ . : -，最长 64
+_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$"
+
+
 def _finite(v: float, name: str) -> float:
     if not isinstance(v, (int, float)) or isinstance(v, bool):
         raise ValueError(f"{name} 必须为数值")
@@ -81,12 +85,27 @@ class ZoneRef(BaseModel):
 
 
 class ReviewParamsBase(BaseModel):
-    """审查参数基类：禁区版本引用、初始刀尖、刀半径、可选净间隙/多刀。
+    """审查参数基类：禁区版本引用（或机床基线引用）、初始刀尖、刀半径、
+    可选净间隙/多刀。
+
+    禁区组合二选一（互斥，均不给或同时给均 422）：
+    - zones：禁区编号 + 明确版本列表（旧用法，保持兼容）；
+    - machine_no + baseline_version：按机床已核准的禁区组合基线提交，
+      审查时解析为该基线固化的禁区版本快照。
 
     POST /reviews 与分块上传会话创建（POST /uploads）共用同一套校验，
     保证两种提交方式的审查口径完全一致。
     """
-    zones: list[ZoneRef] = Field(min_length=1)
+    zones: list[ZoneRef] | None = Field(
+        default=None,
+        description="禁区编号 + 明确版本列表（与机床基线引用二选一）")
+    # 机床基线引用（与 zones 二选一）：提交时基线必须存在且不可变
+    machine_no: str | None = Field(
+        default=None, min_length=1, max_length=64, pattern=_ID_PATTERN,
+        description="机床编号（与 baseline_version 同传，与 zones 二选一）")
+    baseline_version: int | None = Field(
+        default=None, ge=1,
+        description="机床基线版本（与 machine_no 同传；首版为 1）")
     start: tuple[float, float, float]
     tool_radius: float = Field(ge=0.0)
     # 可选：启用后计算全程最小水平净间隙并随报告固化
@@ -95,6 +114,33 @@ class ReviewParamsBase(BaseModel):
     # 传入（含空映射）即启用：初始刀位仍用 tool_radius，G-code 中 Tn 切换；
     # 不传时 T 被忽略，保持单刀旧行为。
     tool_radii: dict[int, float] | None = None
+
+    @model_validator(mode="after")
+    def _zones_or_baseline_exclusive(self) -> "ReviewParamsBase":
+        has_zones = bool(self.zones)
+        has_baseline = (self.machine_no is not None
+                        and self.baseline_version is not None)
+        if self.machine_no is not None and self.baseline_version is None:
+            raise ValueError(
+                "使用机床基线时必须同时提供 machine_no 与 baseline_version")
+        if self.baseline_version is not None and self.machine_no is None:
+            raise ValueError(
+                "使用机床基线时必须同时提供 machine_no 与 baseline_version")
+        if has_zones and has_baseline:
+            raise ValueError("zones 与机床基线引用（machine_no + "
+                             "baseline_version）互斥，不能同时提供")
+        if not has_zones and not has_baseline:
+            raise ValueError("必须提供 zones，或提供机床基线引用 "
+                             "（machine_no + baseline_version）")
+        return self
+
+    def resolved_zone_refs(self) -> list[dict[str, int]]:
+        """返回本次提交显式给出的禁区引用（zones 用法）。
+
+        基线引用由 API 层在事务内解析为具体版本快照后再调用。
+        """
+        return [{"zone_no": z.zone_no, "version": z.version}
+                for z in (self.zones or [])]
 
     @field_validator("include_min_clearance", mode="before")
     @classmethod
@@ -225,8 +271,7 @@ class ReviewResponse(BaseModel):
 
 # ---------- 批量审查 ----------
 
-# 批次/任务标识：字母数字开头，可含 _ . : -，最长 64
-_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$"
+# 批次/任务标识复用模块级 _ID_PATTERN（字母数字开头，可含 _ . : -，最长 64）
 
 
 class BatchReviewItem(ReviewRequest):
@@ -268,6 +313,44 @@ class BatchReviewResponse(BaseModel):
     batch_id: str
     item_count: int
     results: list[BatchItemResult]
+
+
+# ---------- 机床禁区组合基线 ----------
+
+class BaselineCreate(BaseModel):
+    """提交/修订机床禁区组合基线。
+
+    机床编号在路径中给出；zones 为一组互不重复的禁区编号 + 明确版本
+    （至少 1 项）。首版版本号自动为 1，每次修订产生 +1 的不可变新版本。
+    组内禁区编号重复、引用的禁区或禁区版本不存在一律拒绝，不写入基线。
+    """
+    zones: list[ZoneRef] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _unique_zone_nos(self) -> "BaselineCreate":
+        seen: set[int] = set()
+        for ref in self.zones:
+            if ref.zone_no in seen:
+                raise ValueError(
+                    f"禁区编号 {ref.zone_no} 在基线组内重复")
+            seen.add(ref.zone_no)
+        return self
+
+
+class BaselineOut(BaseModel):
+    """基线版本：版本号与固定禁区清单（按禁区编号升序）。"""
+    machine_no: str
+    version: int
+    zones: list[ZoneRef] = Field(
+        description="固定禁区清单 [{zone_no, version}, ...]，按禁区编号升序")
+    created_at: datetime
+
+
+class MachineOut(BaseModel):
+    """机床：编号与当前（最新）基线版本（尚无基线则为 0）。"""
+    machine_no: str
+    current_version: int
+    created_at: datetime
 
 
 # ---------- 长 G-code 可恢复分块上传 ----------

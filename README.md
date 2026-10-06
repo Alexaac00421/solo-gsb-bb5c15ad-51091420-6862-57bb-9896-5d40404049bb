@@ -1,12 +1,17 @@
 # 数控刀路禁入区审查服务
 
-基于 **FastAPI + PostgreSQL** 的 HTTP 服务，用于登记毫米制二维禁入区并对 G-code 刀路进行连续碰撞审查，出具不可变审查报告。
+基于 **FastAPI + PostgreSQL** 的 HTTP 服务，用于登记毫米制二维禁入区、按机床复用已核准的禁区组合基线，并对 G-code 刀路进行连续碰撞审查，出具不可变审查报告。
 
 ## 功能概览
 
 - 禁区以**毫米制二维多边形 + 闭合 Z 高度范围 `[z_min, z_max]`** 登记；
 - 禁区几何采用**不可变版本**：每次修改生成新版本，旧版本永久保留；
-- 审查输入：禁区编号及**明确版本**、毫米制初始刀尖坐标 `(x, y, z)`、初始刀具半径（mm）、G-code 文本；
+- **机床禁区组合基线**（`/machines`，v1.6）：按**机床编号**提交一组互不重复的
+  **禁区编号 + 明确版本**，**首版为 1**，每次修订产生**递增且不可变**的新版本，
+  旧版本永久可查；单项审查、批量任务与分块上传建会话可用
+  **「机床编号 + 基线版本」代替 `zones`**，审查时解析为基线固化的禁区版本快照，
+  见下文「机床禁区组合基线」；
+- 审查输入：禁区编号及**明确版本**（或机床编号 + 基线版本）、毫米制初始刀尖坐标 `(x, y, z)`、初始刀具半径（mm）、G-code 文本；
 - **可选多刀半径映射**（请求中 `"tool_radii": {刀号: 半径mm}` 启用）：同一份 G-code 可使用多把刀，
   见下文「多刀审查」；不传映射时 `T` 仍被忽略，单刀请求与旧报告完全兼容；
 - G-code 模态解析：`G0/G1/G2/G3`、`G17`、`G20/G21`、`G90/G91`；缺省轴沿用前值；
@@ -71,9 +76,9 @@ docker compose up --build
 首次启动时应用会自动连接 PostgreSQL 并完成数据库表初始化（`create_all`），无需手工建表；
 对**升级前的旧库**会幂等补齐 `reports` 表的最小净间隙列（`ALTER TABLE ... ADD COLUMN`），
 v1.2 的多刀命中刀号/半径列（`collision_tool_no` / `collision_tool_radius`），
-以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 新增的 `batches` 批量审查表
-与 v1.5 新增的 `upload_sessions` / `upload_chunks` 分块上传表
-均由 `create_all` 对旧库幂等建出。
+以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 新增的 `batches` 批量审查表、
+v1.5 新增的 `upload_sessions` / `upload_chunks` 分块上传表，以及 v1.6 新增的
+`machines` / `zone_baselines` 机床禁区组合基线表均由 `create_all` 对旧库幂等建出。
 旧报告读取为 `min_clearance_enabled=false`、`min_clearance=null`，多刀字段为 `null`，
 `execution_trace=null`，旧请求行为不变。
 
@@ -142,7 +147,92 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 `POST /zones/{zone_no}/versions`，请求体同几何部分；版本号自动在上一版本基础上 +1，旧版本不变。
 
-### 4. 提交刀路审查
+### 4. 机床禁区组合基线（按机床复用已核准组合，v1.6）
+
+车间可将同一台机床的固定禁区组合登记为**基线**：用**机床编号**和一组**互不重复的禁区编号 +
+明确版本**提交，**首版为 1**；每次修订产生**递增且不可变**的新版本，旧版本永久可查。
+单项审查、批量任务与分块上传建会话可用**「机床编号 + 基线版本」代替 `zones`**。
+
+机床编号规则：字母数字开头，可含 `_ . : -`，最长 64（如 `CNC-01`、`M_3:A`）。
+
+#### 4.1 提交/修订基线
+
+`POST /machines/{machine_no}/baselines`
+
+```json
+{
+  "zones": [
+    {"zone_no": 1, "version": 1},
+    {"zone_no": 2, "version": 1}
+  ]
+}
+```
+
+- 该机床**首次提交**自动产生**版本 1**；之后每次提交（含内容与旧版完全相同的修订）
+  都产生 **+1 的不可变新版本**，已提交的任何旧版本内容与编号都不变；
+- `zones`：**至少 1 项**、互不重复的禁区编号 + **明确版本**（与审查请求中的
+  `zones` 元素同形），返回中按禁区编号升序固化；
+- 成功返回 `201`，含基线版本与固定禁区清单：
+
+```json
+{
+  "machine_no": "CNC-01",
+  "version": 1,
+  "zones": [{"zone_no": 1, "version": 1}, {"zone_no": 2, "version": 1}],
+  "created_at": "..."
+}
+```
+
+- **拒绝且不写入基线**（不产生任何版本，机床首次提交失败时连机床也不创建）：
+  组内禁区编号重复 / 空清单（`422`）、禁区编号或禁区版本不存在（`404`）；
+- **并发修订同一机床**：各请求串行推进版本序列，**每个成功提交各获不同版本**，
+  不丢失任何已成功提交的版本（版本 1..N 连续存在）。
+
+#### 4.2 查询基线（旧版本永久可查）
+
+- `GET /machines`：列出全部机床编号与**当前（最新）基线版本**（尚无基线的机床不存在）；
+- `GET /machines/{machine_no}/baselines`：该机床全部不可变基线版本（按版本升序）；
+- `GET /machines/{machine_no}/baselines/{version}`：指定版本基线，返回版本号与固定禁区清单；
+- 机床不存在 / 指定版本不存在返回 `404`；机床编号非法返回 `422`。
+
+#### 4.3 用「机床编号 + 基线版本」提交审查
+
+`POST /reviews`、`POST /reviews/batch` 的每个任务项、`POST /uploads` 建会话，
+请求体中**以下两种引用二选一**（互斥；同时给、都不给、只给一半均 `422`）：
+
+| 用法 | 字段 |
+| --- | --- |
+| 直接给禁区版本（旧用法，完全兼容） | `"zones": [{"zone_no": 1, "version": 1}, ...]` |
+| 引用机床基线 | `"machine_no": "CNC-01", "baseline_version": 1` |
+
+```json
+{
+  "machine_no": "CNC-01",
+  "baseline_version": 1,
+  "start": [-5.0, 5.0, 0.0],
+  "tool_radius": 0.5,
+  "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n"
+}
+```
+
+口径要点：
+
+- 审查时把基线**解析为该版本固定的禁区版本快照**，后续再修订基线（出新基线版本）、
+  禁区再出新版本都**不影响**本次引用；基线机床或版本不存在返回 `404`，
+  不生成报告/不创建上传会话；
+- 基线引用与 `zones` **同传一律 `422`**，不留报告、不创建会话；
+- **报告继续固化 `used_zone_versions`**：值为基线解析后的实际禁区编号 → 版本
+  （如上例 `{"1": 1, "2": 1}`），报告字段与旧报告完全一致，客户端无需区分引用来源；
+- **批量任务**：每项独立选择 `zones` 或基线引用；任一项引用的基线/禁区版本不存在
+  或其他输入非法，仍按既有规则 `422` 逐项错误且**整批不落报告**；
+  相同 `batch_id` 的幂等/冲突判定基于规范化后的请求（等价于解析后的引用内容）；
+- **分块上传**：**建会话时**即把基线解析为禁区版本快照并随会话冻结，
+  返回的 `params.zones` 为解析后的明确引用（`params` 中不保留 `machine_no`/
+  `baseline_version`）；随后机床修订基线、禁区出新版本均不影响本会话，
+  **完成时沿用建会话时的快照**，分块重传/完成声明的幂等与冲突规则保持不变；
+- 原有 `zones` 请求、报告字段、批次幂等及分块重传/完成规则**全部保持兼容**。
+
+### 5. 提交刀路审查
 
 `POST /reviews`
 
@@ -160,6 +250,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 `include_min_clearance` 可省略（默认 `false`，行为与旧版完全一致），且只接受布尔值
 （`true`/`false`，传 `"true"`/`1` 等一律 `422`）。`tool_radii` 可省略（默认不传，单刀模式），
 见下文「多刀审查」。
+
+请求体中的 `zones` 可用机床基线引用替代：删除 `zones`、改传
+`"machine_no": "CNC-01", "baseline_version": 1`（二者互斥，详见上文第 4 节）。
+报告中的 `used_zone_versions` 仍为解析后的实际禁区编号 → 版本，与旧用法一致。
 
 碰撞响应示例：
 
@@ -229,7 +323,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 - 未启用的请求与升级前已生成的旧报告：`min_clearance_enabled=false`、`min_clearance=null`，
   旧客户端解析不受影响。
 
-### 5. 多刀审查（可选：`tool_radii` 刀号 → 半径映射）
+### 6. 多刀审查（可选：`tool_radii` 刀号 → 半径映射）
 
 `POST /reviews` 请求可选传入 `"tool_radii"`：**非负整数刀号**到**非负有限毫米半径**的映射，
 JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 均拒绝）。
@@ -269,7 +363,7 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 - `T` 刀号未在 `tool_radii` 中映射（空映射时任何 `T` 都拒绝）；
 - 映射本身非法：刀号非非负整数、半径为负/非有限/非数值（如 `"1": -0.5`、`"x": 1`）。
 
-### 6. 执行事件轨迹（多刀模式随报告固化）
+### 7. 执行事件轨迹（多刀模式随报告固化）
 
 多刀模式（传入 `tool_radii`）下，提交响应与 `GET /reports/{report_id}` 均包含
 `execution_trace`：**按执行顺序**记录的可回看事件轨迹——
@@ -320,7 +414,7 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
   旧客户端解析不受影响；
 - 非法 `T` 仍按原规则 `422` 拒绝且**不留任何报告**（自然也不产生轨迹）。
 
-### 7. 批量审查（一次提交 1～50 项有序任务，`batch_id` 幂等）
+### 8. 批量审查（一次提交 1～50 项有序任务，`batch_id` 幂等）
 
 `POST /reviews/batch`
 
@@ -345,7 +439,8 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 - `batch_id`：批次幂等键，必填；字母数字开头，可含 `_ . : -`，最长 64。
 - `items`：**1～50 项**有序任务；每项为完整的单项审查输入（同 `POST /reviews`），
   可另带可选 `task_id`（批内唯一，校验规则同 `batch_id`；省略时按输入顺序号标识）。
-  每项独立使用最小净间隙与多刀参数，任务之间互不影响。
+  每项独立给出 `zones` 或 `machine_no + baseline_version`（二选一）、使用最小净间隙
+  与多刀参数，任务之间互不影响；任一项基线/禁区版本不存在同样整批拒绝。
 - **同一事务**：先逐项校验并固定各项引用的禁区版本快照，全部通过才按**输入顺序**
   生成不可变报告并统一提交；任一项几何、G-code、参数或任务标识非法时，
   返回 `422` 与**逐项错误**（`failed_items` 仅列失败项，含 `index`/`task_id`/`error`），
@@ -386,18 +481,19 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
   （`batch_conflict`）且不生成新报告。内容按逐项规范化请求计算 SHA-256 判定；
   并发同 `batch_id` 由数据库唯一约束兜底，结果一致。
 
-### 8. 长 G-code 可恢复分块上传（`/uploads`，v1.5）
+### 9. 长 G-code 可恢复分块上传（`/uploads`，v1.5）
 
 车间网络不稳时，长 G-code 不必一次性提交：先建会话冻结审查参数，再分块乱序上传，
 断网恢复后按已收序号续传，最后声明块数与整文摘要完成审查。
 全部状态落库（`upload_sessions` / `upload_chunks`），**跨服务重启保留**。
 
-#### 8.1 创建上传会话
+#### 9.1 创建上传会话
 
 `POST /uploads`
 
-请求体与 `POST /reviews` 相同但**不含 `gcode`**（禁区编号 + 明确版本、初始刀尖坐标、
-刀半径、可选 `include_min_clearance` / `tool_radii`，校验口径一致）：
+请求体与 `POST /reviews` 相同但**不含 `gcode`**（`zones` 或 `machine_no +
+baseline_version` 二选一、初始刀尖坐标、刀半径、可选 `include_min_clearance` /
+`tool_radii`，校验口径一致）：
 
 ```json
 {
@@ -409,8 +505,12 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 }
 ```
 
-创建时即校验禁区编号与明确版本存在（404/422 同 `/reviews`），参数**冻结**随会话落库
-（随后禁区再出新版本不影响本会话，完成时仍按固定的明确版本审查）。
+创建时即校验引用存在（404/422 同 `/reviews`），参数**冻结**随会话落库：
+随后禁区再出新版本不影响本会话，完成时仍按固定的明确版本审查。
+使用机床基线（`machine_no` + `baseline_version`）建会话时，基线**在建会话时即解析**
+为明确禁区版本快照，返回的 `params` 中只保留解析后的 `zones`
+（不含 `machine_no`/`baseline_version`）；随后机床修订基线也不影响本会话，
+完成时沿用建会话时的快照。
 返回 `201` 与会话标识及上限：
 
 ```json
@@ -430,7 +530,7 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 }
 ```
 
-#### 8.2 提交文本块（0 起序号，可乱序）
+#### 9.2 提交文本块（0 起序号，可乱序）
 
 `PUT /uploads/{session_id}/chunks/{seq}`
 
@@ -449,7 +549,7 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
  "sha256": "6f1febdda7724a284d20ad4d8aae10a06668013b9eaeebe98608d9945ef6e427"}
 ```
 
-#### 8.3 查询会话与已收序号
+#### 9.3 查询会话与已收序号
 
 `GET /uploads/{session_id}`
 
@@ -457,7 +557,7 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 `received_count` / `total_bytes`、完成后的 `declared_chunk_count` /
 `declared_sha256` / `report_id` 等。
 
-#### 8.4 完成上传（声明块数 + 整文 SHA-256）
+#### 9.4 完成上传（声明块数 + 整文 SHA-256）
 
 `POST /uploads/{session_id}/complete`
 
@@ -486,7 +586,7 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 | G-code 解析/参数非法 | 422 | 与 `/reviews` 同形（如 `invalid_gcode`，含行号） |
 | 块数/摘要格式非法 | 422 | 请求校验错误 |
 
-#### 8.5 完整流程示例
+#### 9.5 完整流程示例
 
 ```bash
 # 1) 创建会话（冻结审查参数）
@@ -509,7 +609,7 @@ curl -s -X POST "http://localhost:8080/uploads/$SID/complete" \
   -d "{\"chunk_count\": 3, \"sha256\": \"$DIGEST\"}"
 ```
 
-### 9. 查询报告（不可变）
+### 10. 查询报告（不可变）
 
 `GET /reports/{report_id}`
 
@@ -522,6 +622,23 @@ curl -s -X POST "http://localhost:8080/uploads/$SID/complete" \
 curl -s -X POST http://localhost:8080/zones \
   -H 'Content-Type: application/json' \
   -d '{"zone_no":1,"polygon":[[0,0],[10,0],[10,10],[0,10]],"z_min":-5,"z_max":5}'
+
+# 为机床 CNC-01 提交禁区组合基线（首版 1，返回版本与固定禁区清单）
+curl -s -X POST http://localhost:8080/machines/CNC-01/baselines \
+  -H 'Content-Type: application/json' \
+  -d '{"zones":[{"zone_no":1,"version":1}]}'
+
+# 用「机床编号+基线版本」代替 zones 提交审查（报告仍固化 used_zone_versions）
+curl -s -X POST http://localhost:8080/reviews \
+  -H 'Content-Type: application/json' \
+  -d '{"machine_no":"CNC-01","baseline_version":1,"start":[-5,5,0],
+       "tool_radius":0.5,"gcode":"G21 G90 G17\nG1 X15 Y5 Z0\n"}'
+
+# 修订基线（产生不可变版本 2）并查询全部旧版本
+curl -s -X POST http://localhost:8080/machines/CNC-01/baselines \
+  -H 'Content-Type: application/json' \
+  -d '{"zones":[{"zone_no":1,"version":1}]}'
+curl -s http://localhost:8080/machines/CNC-01/baselines
 
 # 提交审查
 curl -s -X POST http://localhost:8080/reviews \
@@ -568,9 +685,9 @@ curl -s -X POST http://localhost:8080/reviews \
 
 ```
 app/
-  main.py        # FastAPI 路由：禁区/版本/审查/批量审查/分块上传/报告
-  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹、批量输出与分块上传）
-  models.py      # zones / zone_versions / reports / batches
+  main.py        # FastAPI 路由：禁区/版本/机床基线/审查/批量审查/分块上传/报告
+  schemas.py     # 请求响应模型与输入校验（含机床基线、执行事件轨迹、批量与分块上传）
+  models.py      # zones / zone_versions / machines / zone_baselines / reports / batches
                  # / upload_sessions / upload_chunks 表
   database.py    # 引擎与会话
   gcode.py       # G-code 词法/模态解析（含多刀 T 切换与静止换刀事件）
@@ -603,4 +720,9 @@ Z 窗口截取/边界接触为零/负值/无运动段/等值裁决/固化与兼�
 以及分块上传（会话冻结审查参数与明确版本、乱序块与行中间切块、同号同内容幂等回执/
 同号异内容 409、空块/非 UTF-8/单块 64 KiB/总量 8 MiB 上限、缺块/越界块/摘要不符/
 解析失败均不留报告且会话保持 open、完成与单项审查口径一致、相同声明重放与并发返回
-同一报告、完成后不同声明冲突且拒绝新块、旧库启动幂等建新表）等场景。
+同一报告、完成后不同声明冲突且拒绝新块、旧库启动幂等建新表），
+以及机床禁区组合基线（首版 1 与修订递增不可变、旧版可查、组内编号重复/
+禁区或版本不存在拒绝且不写基线不建机床、单项审查/批量/分块建会话用机床编号+
+基线版本代替 zones 且互斥校验、报告固化解析后的 used_zone_versions、
+上传建会话即冻结解析快照、批内基线非法整批不落报告、并发修订各获 1..N 不同版本、
+旧 zones 请求兼容）等场景。
